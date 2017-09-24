@@ -1,5 +1,5 @@
 require 'ceedling/constants'
-
+require 'concurrent'
 
 class TestInvoker
 
@@ -54,68 +54,97 @@ class TestInvoker
     end
   end
 
-  def setup_and_invoke(tests, context=TEST_SYM, options={:force_run => true})
-  
-    @tests = tests
+  def setup_test(test, context, options)
+    # announce beginning of test run
+    header = "Test '#{File.basename(test)}'"
+    @streaminator.stdout_puts("\n\n#{header}\n#{'-' * header.length}")
 
-    @project_config_manager.process_test_config_change
-  
-    @tests.each do |test|
-      # announce beginning of test run
-      header = "Test '#{File.basename(test)}'"
-      @streaminator.stdout_puts("\n\n#{header}\n#{'-' * header.length}")
+    begin
+      @plugin_manager.pre_test( test )
+      
+      # collect up test fixture pieces & parts
+      runner       = @file_path_utils.form_runner_filepath_from_test( test )
+      mock_list    = @preprocessinator.preprocess_test_and_invoke_test_mocks( test )
+      sources      = @test_invoker_helper.extract_sources( test )
+      extras       = @configurator.collection_test_fixture_extra_link_objects
+      core         = [test] + mock_list + sources
+      objects      = @file_path_utils.form_test_build_objects_filelist( [runner] + core + extras )
+      results_pass = @file_path_utils.form_pass_results_filepath( test )
+      results_fail = @file_path_utils.form_fail_results_filepath( test )
 
+      # add the definition value in the build option for the unit test
+      if @configurator.defines_use_test_definition
+        add_test_definition(test)
+      end
+
+      # clean results files so we have a missing file with which to kick off rake's dependency rules
+      @test_invoker_helper.clean_results( {:pass => results_pass, :fail => results_fail}, options )
+
+      # load up auxiliary dependencies so deep changes cause rebuilding appropriately
+      @test_invoker_helper.process_deep_dependencies( core ) do |dependencies_list| 
+        @dependinator.load_test_object_deep_dependencies( dependencies_list )
+      end
+
+      # tell rake to create test runner if needed
+      @task_invoker.invoke_test_runner( runner )
+
+      # enhance object file dependencies to capture externalities influencing regeneration
+      @dependinator.enhance_test_build_object_dependencies( objects )
+
+      # associate object files with executable
+      @dependinator.setup_test_executable_dependencies( test, objects )
+      
+      res = {:sources => sources, :mock_list => mock_list, :results_pass => results_pass}
+    rescue => e
+      @build_invoker_utils.process_exception( e, context )
+      
+      res = nil
+    end
+    
+    res
+  end
+
+  def invoke_test(res, test, context)
+    unless res.nil?
       begin
-        @plugin_manager.pre_test( test )
-        
-        # collect up test fixture pieces & parts
-        runner       = @file_path_utils.form_runner_filepath_from_test( test )
-        mock_list    = @preprocessinator.preprocess_test_and_invoke_test_mocks( test )
-        sources      = @test_invoker_helper.extract_sources( test )
-        extras       = @configurator.collection_test_fixture_extra_link_objects
-        core         = [test] + mock_list + sources
-        objects      = @file_path_utils.form_test_build_objects_filelist( [runner] + core + extras )
-        results_pass = @file_path_utils.form_pass_results_filepath( test )
-        results_fail = @file_path_utils.form_fail_results_filepath( test )
-        
-        # add the definition value in the build option for the unit test
-        if @configurator.defines_use_test_definition
-          add_test_definition(test)
-        end
-
-        # clean results files so we have a missing file with which to kick off rake's dependency rules
-        @test_invoker_helper.clean_results( {:pass => results_pass, :fail => results_fail}, options )
-
-        # load up auxiliary dependencies so deep changes cause rebuilding appropriately
-        @test_invoker_helper.process_deep_dependencies( core ) do |dependencies_list| 
-          @dependinator.load_test_object_deep_dependencies( dependencies_list )
-        end
-
-        # tell rake to create test runner if needed
-        @task_invoker.invoke_test_runner( runner )
-
-        # enhance object file dependencies to capture externalities influencing regeneration
-        @dependinator.enhance_test_build_object_dependencies( objects )
-
-        # associate object files with executable
-        @dependinator.setup_test_executable_dependencies( test, objects )
-
         # 3, 2, 1... launch
-        @task_invoker.invoke_test_results( results_pass )        
+        @task_invoker.invoke_test_results( res[:results_pass] )        
       rescue => e
         @build_invoker_utils.process_exception( e, context )
-      ensure
-        # delete the definition value in the build option for the unit test
-        if @configurator.defines_use_test_definition
-          delete_test_definition(test)
-        end
-        @plugin_manager.post_test( test )
+      end
+    end
+
+    # delete the definition value in the build option for the unit test
+    if @configurator.defines_use_test_definition
+      delete_test_definition(test)
+    end
+
+    @plugin_manager.post_test( test )
+  end
+
+  def setup_and_invoke(tests, context=TEST_SYM, options={:force_run => true})
+    @tests = tests
+  
+    @project_config_manager.process_test_config_change
+  
+    flows = @tests.map do |test|
+      setup_f = Concurrent::dataflow_with(TEST_COMPILE_EXECUTOR) do
+        setup_test(test, context, options) 
       end
       
-      # store away what's been processed
-      @mocks.concat( mock_list )
-      @sources.concat( sources )
+      invoke_f = Concurrent::dataflow_with(TEST_EXECUTE_EXECUTOR, setup_f) do |results|
+         invoke_test(results, test, context)
+      end
+
+      Concurrent::dataflow_with(TEST_COMPILE_EXECUTOR, setup_f, invoke_f) do |results, _| 
+        # store away what's been processed
+        @mocks.concat( results[:mock_list] )
+        @sources.concat( results[:sources] )
+      end
     end
+
+    # Await all threads
+    await!(flows)
 
     # post-process collected mock list
     @mocks.uniq!
@@ -123,6 +152,76 @@ class TestInvoker
     # post-process collected sources list
     @sources.uniq!
   end
+
+  # def setup_and_invoke(tests, context=TEST_SYM, options={:force_run => true})
+  
+  #   @tests = tests
+
+  #   @project_config_manager.process_test_config_change
+  
+  #   @tests.each do |test|
+  #     # announce beginning of test run
+  #     header = "Test '#{File.basename(test)}'"
+  #     @streaminator.stdout_puts("\n\n#{header}\n#{'-' * header.length}")
+
+  #     begin
+  #       @plugin_manager.pre_test( test )
+        
+  #       # collect up test fixture pieces & parts
+  #       runner       = @file_path_utils.form_runner_filepath_from_test( test )
+  #       mock_list    = @preprocessinator.preprocess_test_and_invoke_test_mocks( test )
+  #       sources      = @test_invoker_helper.extract_sources( test )
+  #       extras       = @configurator.collection_test_fixture_extra_link_objects
+  #       core         = [test] + mock_list + sources
+  #       objects      = @file_path_utils.form_test_build_objects_filelist( [runner] + core + extras )
+  #       results_pass = @file_path_utils.form_pass_results_filepath( test )
+  #       results_fail = @file_path_utils.form_fail_results_filepath( test )
+        
+  #       # add the definition value in the build option for the unit test
+  #       if @configurator.defines_use_test_definition
+  #         add_test_definition(test)
+  #       end
+
+  #       # clean results files so we have a missing file with which to kick off rake's dependency rules
+  #       @test_invoker_helper.clean_results( {:pass => results_pass, :fail => results_fail}, options )
+
+  #       # load up auxiliary dependencies so deep changes cause rebuilding appropriately
+  #       @test_invoker_helper.process_deep_dependencies( core ) do |dependencies_list| 
+  #         @dependinator.load_test_object_deep_dependencies( dependencies_list )
+  #       end
+
+  #       # tell rake to create test runner if needed
+  #       @task_invoker.invoke_test_runner( runner )
+
+  #       # enhance object file dependencies to capture externalities influencing regeneration
+  #       @dependinator.enhance_test_build_object_dependencies( objects )
+
+  #       # associate object files with executable
+  #       @dependinator.setup_test_executable_dependencies( test, objects )
+
+  #       # 3, 2, 1... launch
+  #       @task_invoker.invoke_test_results( results_pass )        
+  #     rescue => e
+  #       @build_invoker_utils.process_exception( e, context )
+  #     ensure
+  #       # delete the definition value in the build option for the unit test
+  #       if @configurator.defines_use_test_definition
+  #         delete_test_definition(test)
+  #       end
+  #       @plugin_manager.post_test( test )
+  #     end
+      
+  #     # store away what's been processed
+  #     @mocks.concat( mock_list )
+  #     @sources.concat( sources )
+  #   end
+
+  #   # post-process collected mock list
+  #   @mocks.uniq!
+    
+  #   # post-process collected sources list
+  #   @sources.uniq!
+  # end
 
 
   def refresh_deep_dependencies
