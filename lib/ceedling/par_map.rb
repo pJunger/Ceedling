@@ -1,8 +1,23 @@
-require 'concurrent'
+class Executors
+  @@compile_executor = nil
+  @@execute_executor = nil
 
-TEST_COMPILE_EXECUTOR = Concurrent::CachedThreadPool.new(PROJECT_COMPILE_THREADS)
-# Simplify threadpooling: Either use the same threadpool as for compiling or special case: Test invocation is not threadsafe -> 1 Thread
-TEST_EXECUTE_EXECUTOR = if PROJECT_TEST_THREADS > 1 then TEST_COMPILE_EXECUTOR else Concurrent::SingleThreadExecutor.new
+  def self.compile
+    if @@compile_executor.nil?
+      @@compile_executor = Concurrent::FixedThreadPool.new(PROJECT_COMPILE_THREADS)
+    end
+    
+    @@compile_executor
+  end
+
+  def self.execute
+    if @@execute_executor.nil?
+      @@execute_executor = if PROJECT_TEST_THREADS > 1 then @@compile_executor else Concurrent::SingleThreadExecutor.new end
+    end
+    
+    @@execute_executor
+  end
+end
 
 def await(futures)
   futures.map {|future| future.value }
@@ -19,6 +34,7 @@ end
 def wait_or_cancel!(futures, timeout)
   futures.each {|future| future.wait_or_cancel(timeout) }
 end
+
 
 def par_map(n, things, &block)
   queue = Queue.new
